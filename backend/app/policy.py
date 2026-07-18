@@ -19,18 +19,22 @@ from .models import (
 )
 
 
-SUSPICIOUS_HOURS_SOURCE = '''def evaluate(event: NormalizedEvent, context: PolicyContext) -> PolicyDecision:
-    """Flag commit, clone, or fork activity in the configured quiet hours."""
+def policy_source(event_types: list[str], quiet_start: int, quiet_end: int, severity: Severity) -> str:
+    """Render a read-only explanation of the validated declarative policy plan."""
+    types = ", ".join(repr(event_type) for event_type in event_types)
+    severity_value = severity.value if isinstance(severity, Severity) else str(severity)
+    return f'''def evaluate(event: NormalizedEvent, context: PolicyContext) -> PolicyDecision:
+    """Evaluate the validated policy plan; generated source is never executed."""
     local_hour = context.local_hour(event.occurred_at)
-    activity = event.event_type in {"repository.commit", "repository.clone", "repository.fork"}
+    activity = event.event_type in {{{types}}}
     excluded = event.actor.service_account or event.actor.id in context.excluded_actor_ids
-    matched = activity and context.quiet_start <= local_hour < context.quiet_end and not excluded
+    matched = activity and {quiet_start} <= local_hour < {quiet_end} and not excluded
     return PolicyDecision(
         matched=matched,
-        severity="high",
+        severity="{severity_value}",
         reason_code="SUSPICIOUS_QUIET_HOURS" if matched else "OUTSIDE_POLICY_SCOPE",
         explanation="Repository activity occurred during configured quiet hours." if matched else "The event is outside the configured policy conditions.",
-        evidence={"event_type": event.event_type, "local_hour": str(local_hour)},
+        evidence={{"event_type": event.event_type, "local_hour": str(local_hour)}},
         action_ref=context.action_ref,
     )
 '''
@@ -79,43 +83,49 @@ def _event(hour: int, event_type: str = "repository.fork", actor_id: str = "alic
     }
 
 
-def suspicious_hours_cases(timezone: str, exclusions: dict[str, Any]) -> list[TestCase]:
+def suspicious_hours_cases(timezone: str, exclusions: dict[str, Any], event_types: list[str], quiet_start: int, quiet_end: int) -> list[TestCase]:
     excluded_ids = exclusions.get("actor_ids", [])
     excluded = excluded_ids[0] if excluded_ids else "automation-bot"
+    event_type = event_types[0]
+    matching_hour = quiet_start
+    non_matching_hour = quiet_end % 24
+    before_hour = (quiet_start - 1) % 24
     return [
-        TestCase(name="matching_activity", scenario_type="positive", input_event=_event(2, timezone_name=timezone), expected_matched=True),
-        TestCase(name="non_matching_activity", scenario_type="negative", input_event=_event(12, timezone_name=timezone), expected_matched=False),
-        TestCase(name="boundary_before", scenario_type="boundary", input_event=_event(0, timezone_name=timezone), expected_matched=False),
-        TestCase(name="boundary_after", scenario_type="boundary", input_event=_event(5, timezone_name=timezone), expected_matched=False),
-        TestCase(name="excluded_actor", scenario_type="exclusion", input_event=_event(2, actor_id=excluded, service_account=True, timezone_name=timezone), expected_matched=False),
+        TestCase(name="matching_activity", scenario_type="positive", input_event=_event(matching_hour, event_type, timezone_name=timezone), expected_matched=True),
+        TestCase(name="non_matching_activity", scenario_type="negative", input_event=_event(non_matching_hour, event_type, timezone_name=timezone), expected_matched=False),
+        TestCase(name="boundary_before", scenario_type="boundary", input_event=_event(before_hour, event_type, timezone_name=timezone), expected_matched=False),
+        TestCase(name="boundary_after", scenario_type="boundary", input_event=_event(non_matching_hour, event_type, timezone_name=timezone), expected_matched=False),
+        TestCase(name="excluded_actor", scenario_type="exclusion", input_event=_event(matching_hour, event_type, actor_id=excluded, service_account=True, timezone_name=timezone), expected_matched=False),
         TestCase(name="malformed_event", scenario_type="malformed", input_event={"event_type": "repository.fork", "dedupe_key": "malformed"}, expected_matched=False),
-        TestCase(name="duplicate_event", scenario_type="duplicate", input_event=_event(2, timezone_name=timezone), expected_matched=False),
+        TestCase(name="duplicate_event", scenario_type="duplicate", input_event=_event(matching_hour, event_type, timezone_name=timezone), expected_matched=False),
     ]
 
 
 def generate_policy(draft: PolicyDraft) -> PolicyArtifact:
-    prompt = draft.prompt.lower()
-    is_suspicious_hours = any(word in prompt for word in ("suspicious", "quiet hours", "01:00", "05:00", "overnight"))
-    if not is_suspicious_hours:
-        # Still return a safe, deterministic artifact for a documented starter scenario.
-        summary = "Detect suspicious GitHub repository activity during quiet hours."
+    requested_types = draft.event_types or ["repository.commit", "repository.clone", "repository.fork"]
+    plan = OllamaPolicyPlanner().plan(prompt=draft.prompt, timezone=draft.timezone, event_types=requested_types, policy_name=draft.name)
+    # The unconfigured path preserves local/offline development and test support.
+    # A configured model failure raises PolicyPlanningError; it is never replaced with a fabricated plan.
+    if plan:
+        policy_name, summary = plan.policy_name, plan.summary
+        required_types, quiet_start, quiet_end = plan.event_types, plan.quiet_start, plan.quiet_end
+        assumptions = [f"Event times are interpreted in {draft.timezone}.", *plan.assumptions]
+        generator = "ollama-policy-planner-v1"
     else:
-        summary = "Detect GitHub commit, clone, or fork activity between 01:00 and 05:00, excluding approved automation."
-    required_types = draft.event_types or ["repository.commit", "repository.clone", "repository.fork"]
-    assumptions = [f"Event times are interpreted in {draft.timezone}.", "Quiet hours use the half-open interval 01:00 inclusive through 05:00 exclusive.", "Missing actor or timestamp fields do not match."]
+        policy_name, summary = draft.name, draft.prompt
+        required_types, quiet_start, quiet_end = requested_types, 1, 5
+        assumptions = [f"Event times are interpreted in {draft.timezone}.", "Offline development plan; configure Ollama to generate a model plan."]
+        generator = "offline-declarative-policy-v1"
     if draft.exclusions:
         assumptions.append("Configured service accounts and actor IDs are excluded.")
-    plan = OllamaPolicyPlanner().plan(prompt=draft.prompt, timezone=draft.timezone, event_types=required_types)
-    if plan:
-        summary = plan.summary
-        assumptions.extend(plan.assumptions)
-    source_hash = validate_policy_source(SUSPICIOUS_HOURS_SOURCE)
+    source = policy_source(required_types, quiet_start, quiet_end, draft.severity)
+    source_hash = validate_policy_source(source)
     return PolicyArtifact(
-        policy_name=draft.name, summary=summary,
-        intent={"scenario": "suspicious_hours", "quiet_start": "01:00", "quiet_end": "05:00", "timezone": draft.timezone, "exclusions": draft.exclusions},
+        policy_name=policy_name, summary=summary,
+        intent={"quiet_start": quiet_start, "quiet_end": quiet_end, "timezone": draft.timezone, "exclusions": draft.exclusions},
         required_event_types=required_types, required_fields=["event_type", "occurred_at", "actor.id", "actor.service_account"],
-        assumptions=assumptions, severity=draft.severity, action_ref=draft.action_ref, python_source=SUSPICIOUS_HOURS_SOURCE,
-        source_sha256=source_hash, generator="ollama-policy-planner-v1" if plan else "deterministic-suspicious-hours-v1", test_cases=suspicious_hours_cases(draft.timezone, draft.exclusions),
+        assumptions=assumptions, severity=draft.severity, action_ref=draft.action_ref, python_source=source,
+        source_sha256=source_hash, generator=generator, test_cases=suspicious_hours_cases(draft.timezone, draft.exclusions, required_types, quiet_start, quiet_end),
     )
 
 
@@ -136,7 +146,9 @@ class SafePolicyRuntime:
         activity = event.event_type in set(artifact.required_event_types)
         excluded_ids = set(artifact.intent.get("exclusions", {}).get("actor_ids", []))
         excluded = event.actor.service_account or event.actor.id in excluded_ids
-        matched = activity and 1 <= local_hour < 5 and not excluded
+        quiet_start = int(artifact.intent.get("quiet_start", 1))
+        quiet_end = int(artifact.intent.get("quiet_end", 5))
+        matched = activity and quiet_start <= local_hour < quiet_end and not excluded
         return PolicyDecision(
             matched=matched, severity=artifact.severity,
             reason_code="SUSPICIOUS_QUIET_HOURS" if matched else "OUTSIDE_POLICY_SCOPE",

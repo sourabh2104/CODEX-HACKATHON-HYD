@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .connectors import CONNECTORS, VENDORS
+from .llm import PolicyPlanningError
 from .models import (
     ActionCreate, ActionDefinition, ActionExecution, ActionMode, ActionStatus, ActionType, Approval, AuditEvent, Check, CheckStatus, Connection, ConnectionCreate,
     ConnectionStatus, ConnectionTest, Evaluation, NormalizedEvent, Policy, PolicyDraft, PolicyDraftCreate, PolicyStatus, PolicyVersion,
@@ -93,12 +94,18 @@ def _enum_value(value: Any) -> str:
 
 
 def _dashboard_data(workspace_id: str) -> dict[str, Any]:
-    connections = [item for item in repo.connections.values() if item.workspace_id == workspace_id]
-    policies = [item for item in repo.policies.values() if item.workspace_id == workspace_id]
-    actions = [item for item in repo.actions.values() if item.workspace_id == workspace_id]
-    events = [item for item in repo.events.values() if item.workspace_id == workspace_id]
-    evaluations = [item for item in repo.evaluations.values() if item.workspace_id == workspace_id]
-    audit_items = [item for item in repo.audits[::-1] if item.workspace_id == workspace_id][:8]
+    demo_enabled = os.getenv("DEMO_MODE", "false").lower() in {"1", "true", "yes", "on"}
+    connections = [item for item in repo.connections.values() if item.workspace_id == workspace_id and (demo_enabled or not item.config.get("demo_seed"))]
+    latest_connections: dict[str, Connection] = {}
+    for item in sorted(connections, key=lambda value: value.created_at, reverse=True):
+        latest_connections.setdefault(item.vendor, item)
+    policies = [item for item in repo.policies.values() if item.workspace_id == workspace_id and (demo_enabled or "demo" not in item.tags)]
+    actions = [item for item in repo.actions.values() if item.workspace_id == workspace_id and (demo_enabled or not item.id.startswith("action_demo"))]
+    active_connection_ids = {item.id for item in latest_connections.values()}
+    events = [item for item in repo.events.values() if item.workspace_id == workspace_id and item.connection_id in active_connection_ids]
+    active_policy_ids = {item.id for item in policies}
+    evaluations = [item for item in repo.evaluations.values() if item.workspace_id == workspace_id and item.event_id in {event.event_id for event in events} and item.policy_id in active_policy_ids]
+    audit_items = [item for item in repo.audits[::-1] if item.workspace_id == workspace_id and (demo_enabled or (item.actor != "demo-seed" and not item.target_id.startswith(("conn_demo", "policy_demo", "action_demo"))))][:8]
     colors = {"github": "#a78bfa", "gitlab": "#f97316", "generic-webhook": "#48a7ff"}
     icons = {"github": "GH", "gitlab": "GL", "generic-webhook": "GW"}
     descriptions = {
@@ -108,8 +115,10 @@ def _dashboard_data(workspace_id: str) -> dict[str, Any]:
     }
     vendor_cards: list[dict[str, Any]] = []
     for definition in VENDORS:
-        connection = next((item for item in connections if item.vendor == definition.key), None)
-        source_events = [item for item in events if item.vendor == definition.key]
+        connection = latest_connections.get(definition.key)
+        if not connection:
+            continue
+        source_events = [item for item in events if item.vendor == definition.key and item.connection_id == connection.id]
         status = _enum_value(connection.status) if connection else "disabled"
         if status == "failed":
             status = "degraded"
@@ -128,6 +137,7 @@ def _dashboard_data(workspace_id: str) -> dict[str, Any]:
             "checks": connection.last_test.checks if connection and connection.last_test else [],
             "remediation": connection.last_test.remediation if connection and connection.last_test else None,
             "eventLog": [item.model_dump(mode="json") for item in sorted(source_events, key=lambda event: event.received_at, reverse=True)[:20]],
+            "repositories": CONNECTORS[connection.vendor].repositories(connection) if hasattr(CONNECTORS[connection.vendor], "repositories") else [],
         })
     policy_cards: list[dict[str, Any]] = []
     for policy in policies:
@@ -292,6 +302,13 @@ def connection_events(connection_id: str, workspace_id: str = Depends(workspace)
     return [event for event in list(repo.events.values())[::-1] if event.workspace_id == workspace_id and event.connection_id == connection_id][:limit]
 
 
+@api.get("/connections/{connection_id}/repositories")
+def connection_repositories(connection_id: str, workspace_id: str = Depends(workspace)) -> list[dict[str, Any]]:
+    connection = connection_or_404(workspace_id, connection_id)
+    connector = CONNECTORS[connection.vendor]
+    return connector.repositories(connection) if hasattr(connector, "repositories") else []
+
+
 @api.post("/webhooks/{vendor}/{connection_id}")
 async def webhook(vendor: str, connection_id: str, request: Request, workspace_id: str = Depends(workspace)) -> dict[str, Any]:
     connection = connection_or_404(workspace_id, connection_id)
@@ -329,7 +346,10 @@ def generate_draft(draft_id: str, workspace_id: str = Depends(workspace), who: s
     draft = repo.drafts.get(draft_id)
     if not draft or draft.workspace_id != workspace_id:
         raise not_found("policy draft", draft_id)
-    draft.artifact = generate_policy(draft)
+    try:
+        draft.artifact = generate_policy(draft)
+    except PolicyPlanningError as exc:
+        raise HTTPException(status_code=503, detail={"code": "LLM_POLICY_GENERATION_FAILED", "message": str(exc)}) from exc
     draft.status = PolicyStatus.DRAFT
     draft.updated_at = datetime.now(timezone.utc)
     audit(workspace_id, "policy.version_generated", "policy_draft", draft.id, who, {"source_sha256": draft.artifact.source_sha256})

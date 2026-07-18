@@ -63,6 +63,7 @@ class GitHubConnector:
         self._webhook_secrets: dict[str, str] = {}
         self._tokens: dict[str, str] = {}
         self._last_events: dict[str, list[NormalizedEvent]] = {}
+        self._last_repositories: dict[str, list[dict[str, Any]]] = {}
 
     def remember_token(self, connection_id: str, token: str) -> None:
         self._tokens[connection_id] = token
@@ -89,7 +90,7 @@ class GitHubConnector:
             checks[2] = Check(name="required_scopes", status=CheckStatus.FAILED, code="ORG_URL_MISMATCH", message=f"Organization name '{org}' does not match the organization URL path '{organization_path}'.")
             return ConnectionTest(status="failed", checks=checks, remediation=Remediation(summary="The organization name and organization URL do not match.", steps=[f"Use '{organization_path}' as the organization login, or change the organization URL to the page for '{org}'.", "Use an organization URL, not a personal profile URL.", "Save the credential and test again."], test_actions=[]))
         try:
-            user_status, _ = self._request(connection, "/user")
+            user_status, user_payload = self._request(connection, "/user")
             if user_status == 401:
                 checks[0] = Check(name="credentials", status=CheckStatus.FAILED, code="INVALID_CREDENTIALS", message="GitHub rejected the personal access token.")
                 checks[1] = Check(name="api_reachability", status=CheckStatus.SKIPPED)
@@ -101,6 +102,8 @@ class GitHubConnector:
                 return ConnectionTest(status="failed", checks=checks, remediation=Remediation(summary="The GitHub API URL is not the GitHub API endpoint.", steps=["Set GitHub API URL to https://api.github.com for GitHub.com.", "For GitHub Enterprise Server, use https://<hostname>/api/v3.", "Keep the organization URL separate from the API URL."], test_actions=[]))
             if user_status >= 400:
                 raise RuntimeError(f"GitHub API returned HTTP {user_status} while validating credentials")
+            if isinstance(user_payload, dict) and user_payload.get("login"):
+                connection.config["account_login"] = str(user_payload["login"])
             org_status, _ = self._request(connection, f"/orgs/{urllib.parse.quote(org)}")
             if org_status in {401, 403, 404}:
                 checks[2] = Check(name="required_scopes", status=CheckStatus.FAILED, code="MISSING_ORG_ACCESS", message="The token cannot read this organization.")
@@ -112,16 +115,16 @@ class GitHubConnector:
                 return ConnectionTest(status="degraded", checks=checks, remediation=Remediation(summary=summary, steps=steps, test_actions=["Create a test branch or fork after access is granted."]))
             audit_status, audit_payload = self._request(connection, f"/orgs/{urllib.parse.quote(org)}/audit-log?per_page=20")
             if audit_status in {403, 404}:
-                fallback_events, repository_count = self._poll_repository_events(connection, org)
+                fallback_events, repository_count, repository_source = self._poll_repository_events(connection, org, str(connection.config.get("account_login") or ""))
                 self._last_events[connection.id] = fallback_events
                 checks[2] = Check(name="required_scopes", status=CheckStatus.SKIPPED, code="AUDIT_LOG_UNAVAILABLE", message="Organization audit-log API is unavailable for this GitHub organization.")
-                checks[3] = Check(name="event_subscription", status=CheckStatus.PASSED, code="REPOSITORY_EVENT_POLLING", message="Repository event polling is available.")
+                checks[3] = Check(name="event_subscription", status=CheckStatus.PASSED, code="REPOSITORY_EVENT_POLLING", message=f"Repository event polling is available for {repository_source} repositories.")
                 if fallback_events:
                     checks[4] = Check(name="sample_event", status=CheckStatus.PASSED, message=f"Retrieved {len(fallback_events)} repository events.")
-                    return ConnectionTest(status="passed", checks=checks, remediation=Remediation(summary="Organization audit logs are unavailable, so repository events are being used.", steps=["Keep the connection enabled to poll accessible repositories.", "For administrative audit events, use GitHub Enterprise Cloud with read:audit_log access."], test_actions=["Push a commit or fork a repository in the organization, then test again."]))
+                    return ConnectionTest(status="passed", checks=checks, remediation=Remediation(summary=f"Organization audit logs are unavailable, so {repository_source} repository events are being used.", steps=["Keep the connection enabled to poll accessible repositories.", "For administrative audit events, use GitHub Enterprise Cloud with read:audit_log access."], test_actions=["Push a commit or fork a repository, then test again."]))
                 no_repositories = repository_count == 0
                 checks[4] = Check(name="sample_event", status=CheckStatus.NOT_AVAILABLE, code="NO_REPOSITORIES" if no_repositories else "NO_ACTIVITY")
-                return ConnectionTest(status="degraded", checks=checks, remediation=Remediation(summary="No repository events were returned." if not no_repositories else "The organization has no accessible repositories yet.", steps=["Move or create a repository inside the organization.", "Push a commit or fork a repository.", "Test the connection again."], test_actions=["Push a commit or fork a repository in the organization."]))
+                return ConnectionTest(status="degraded", checks=checks, remediation=Remediation(summary="No repository events were returned." if not no_repositories else "No accessible repositories were found for the organization or account.", steps=["Move or create a repository inside the organization, or confirm the PAT can read the account repositories.", "Push a commit or fork a repository.", "Test the connection again."], test_actions=["Push a commit or fork a repository."]))
             if audit_status == 401:
                 checks[2] = Check(name="required_scopes", status=CheckStatus.FAILED, code="MISSING_AUDIT_ACCESS", message="The token cannot read the organization audit log.")
                 checks[3] = Check(name="event_subscription", status=CheckStatus.SKIPPED)
@@ -140,10 +143,20 @@ class GitHubConnector:
         except Exception as exc:
             return ConnectionTest(status="failed", checks=[checks[0], Check(name="api_reachability", status=CheckStatus.FAILED, code="GITHUB_API_ERROR", message=str(exc)), Check(name="required_scopes", status=CheckStatus.SKIPPED), Check(name="event_subscription", status=CheckStatus.SKIPPED), Check(name="sample_event", status=CheckStatus.NOT_AVAILABLE)], remediation=Remediation(summary="GitHub returned an unexpected response.", steps=["Inspect the API URL and organization name.", "Try the connection test again."], test_actions=[]))
 
-    def _poll_repository_events(self, connection: Connection, organization: str) -> tuple[list[NormalizedEvent], int]:
+    def _poll_repository_events(self, connection: Connection, organization: str, account_login: str) -> tuple[list[NormalizedEvent], int, str]:
         repository_status, repositories = self._request(connection, f"/orgs/{urllib.parse.quote(organization)}/repos?per_page=100&type=all")
+        repository_source = "organization"
         if repository_status >= 400 or not isinstance(repositories, list):
-            return [], 0
+            repositories = []
+        if not repositories and account_login:
+            user_repository_status, user_repositories = self._request(connection, "/user/repos?per_page=100&affiliation=owner,collaborator,organization_member&visibility=all&sort=updated")
+            if user_repository_status < 400 and isinstance(user_repositories, list):
+                repositories = user_repositories
+                repository_source = "account"
+        self._last_repositories[connection.id] = [
+            {"id": item.get("id"), "name": item.get("name"), "full_name": item.get("full_name"), "private": item.get("private", False), "html_url": item.get("html_url"), "source": repository_source}
+            for item in repositories if isinstance(item, dict) and item.get("full_name")
+        ]
         normalized: list[NormalizedEvent] = []
         for repository in repositories:
             if not isinstance(repository, dict):
@@ -162,7 +175,10 @@ class GitHubConnector:
                 event["repository"] = {"id": repository.get("id"), "name": repository.get("name"), "full_name": full_name, "organization": organization}
                 event["occurred_at"] = payload.get("created_at") or utcnow()
                 normalized.append(self.normalize(event, connection, utcnow()))
-        return normalized, len(repositories)
+        return normalized, len(repositories), repository_source
+
+    def repositories(self, connection: Connection) -> list[dict[str, Any]]:
+        return self._last_repositories.get(connection.id, [])
 
     @staticmethod
     def _repository_event_type(payload: dict[str, Any]) -> str:

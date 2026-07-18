@@ -132,7 +132,7 @@ def test_dashboard_contract_returns_catalog_and_runtime_state(client):
     assert response.status_code == 200
     assert response.headers["access-control-allow-origin"] == "http://localhost:5173"
     dashboard = response.json()
-    assert {item["key"] for item in dashboard["vendors"]} >= {"github", "gitlab", "generic-webhook"}
+    assert {item["key"] for item in dashboard["vendors"]} == {"github"}
     github = next(item for item in dashboard["vendors"] if item["key"] == "github")
     assert github["status"] == "connected"
     assert dashboard["actions"][0]["mode"] == "Dry-run"

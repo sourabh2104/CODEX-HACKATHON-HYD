@@ -3,6 +3,7 @@ export type Severity = 'low' | 'medium' | 'high' | 'critical';
 
 export interface ConnectionCheck { name: string; status: string; code?: string; message?: string; }
 export interface ActivityEvent { event_id: string; event_type: string; occurred_at: string; actor?: { id?: string | null; name?: string | null }; resource?: { name?: string | null }; }
+export interface RepositorySummary { id?: number; name?: string; full_name?: string; private?: boolean; html_url?: string; source?: string; }
 export interface PolicyTestCase { name: string; input_event: Record<string, unknown>; expected_matched: boolean; mandatory?: boolean; scenario_type?: string; }
 export interface PolicyArtifact { policy_name: string; summary: string; assumptions: string[]; severity: Severity; python_source: string; source_sha256: string; test_cases: PolicyTestCase[]; }
 export interface PolicyTestResult { case_name: string; expected_matched: boolean; actual_matched?: boolean | null; passed: boolean; reason_code?: string | null; explanation?: string | null; error?: string | null; }
@@ -23,6 +24,7 @@ export interface Vendor {
   checks?: ConnectionCheck[];
   remediation?: { summary: string; steps: string[]; test_actions: string[] } | null;
   eventLog?: ActivityEvent[];
+  repositories?: RepositorySummary[];
 }
 
 export interface Policy {

@@ -1,5 +1,5 @@
 import { demoData } from './demo';
-import type { ActivityEvent, ConnectionCheck, DashboardData } from '../types';
+import type { ActivityEvent, ConnectionCheck, DashboardData, RepositorySummary } from '../types';
 
 const configuredBaseUrl = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, '');
 
@@ -27,6 +27,7 @@ export async function getDashboard(): Promise<{ data: DashboardData; demo: boole
 export const api = {
   testConnection: (id: string) => request<{ status: string; checks?: ConnectionCheck[]; remediation?: Record<string, unknown> }>(`/api/v1/connections/${id}/test`, { method: 'POST' }),
   connectionEvents: (id: string, refresh = false) => request<ActivityEvent[]>(`/api/v1/connections/${id}/events${refresh ? '?refresh=true' : ''}`),
+  connectionRepositories: (id: string) => request<RepositorySummary[]>(`/api/v1/connections/${id}/repositories`),
   enableConnection: (id: string) => request(`/api/v1/connections/${id}/enable`, { method: 'POST' }),
   createConnection: <T = Record<string, unknown>>(payload: unknown) => request<T>('/api/v1/connections', { method: 'POST', body: JSON.stringify(payload) }),
   generatePolicy: <T = { id: string }>(payload: unknown) => request<T>('/api/v1/policy-drafts', { method: 'POST', body: JSON.stringify(payload) }),
