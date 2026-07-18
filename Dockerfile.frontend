@@ -1,0 +1,21 @@
+FROM node:22-alpine
+
+WORKDIR /workspace
+COPY . /workspace
+
+# Install whichever lockfile the frontend supplies. This keeps the integration
+# layer independent of whether the UI uses npm, pnpm, or Yarn.
+RUN set -eux; \
+    if [ -f frontend/pnpm-lock.yaml ]; then \
+      corepack enable; corepack pnpm install --dir frontend --frozen-lockfile; \
+    elif [ -f frontend/yarn.lock ]; then \
+      corepack enable; corepack yarn --cwd frontend install --immutable || corepack yarn --cwd frontend install --frozen-lockfile; \
+    elif [ -f frontend/package-lock.json ]; then \
+      npm ci --prefix frontend; \
+    elif [ -f frontend/package.json ]; then \
+      npm install --prefix frontend; \
+    else \
+      true; \
+    fi
+
+CMD ["sh", "/workspace/scripts/serve-frontend.sh"]

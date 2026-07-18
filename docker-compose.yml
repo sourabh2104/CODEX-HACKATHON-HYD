@@ -1,0 +1,228 @@
+name: ${COMPOSE_PROJECT_NAME:-activity-policy-control-plane}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-activity_policy}
+      POSTGRES_USER: ${POSTGRES_USER:-activity}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-activity-local-password}
+    ports:
+      - "${HOST_BIND:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  nats:
+    image: nats:2.10-alpine
+    restart: unless-stopped
+    command: ["--jetstream", "--store_dir", "/data", "--http_port", "8222"]
+    ports:
+      - "${HOST_BIND:-127.0.0.1}:${NATS_PORT:-4222}:4222"
+      - "${HOST_BIND:-127.0.0.1}:${NATS_MONITOR_PORT:-8222}:8222"
+    volumes:
+      - nats_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8222/healthz >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  valkey:
+    image: valkey/valkey:8-alpine
+    restart: unless-stopped
+    command: ["valkey-server", "--appendonly", "yes"]
+    ports:
+      - "${HOST_BIND:-127.0.0.1}:${VALKEY_PORT:-6379}:6379"
+    volumes:
+      - valkey_data:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minio-local-password}
+    ports:
+      - "${HOST_BIND:-127.0.0.1}:${MINIO_PORT:-9000}:9000"
+      - "${HOST_BIND:-127.0.0.1}:${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  minio-init:
+    image: minio/mc:latest
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-ec"]
+    command: >-
+      mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}";
+      mc mb --ignore-existing "local/$${MINIO_BUCKET}";
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minio-local-password}
+      MINIO_BUCKET: ${MINIO_BUCKET:-activity-artifacts}
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.3
+    restart: unless-stopped
+    command: ["start-dev", "--http-port=8080", "--health-enabled=true"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin-local-password}
+      KC_HEALTH_ENABLED: "true"
+    ports:
+      - "${HOST_BIND:-127.0.0.1}:${KEYCLOAK_PORT:-8080}:8080"
+    volumes:
+      - keycloak_data:/opt/keycloak/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/health/ready >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  openbao:
+    image: openbao/openbao:2.2
+    restart: unless-stopped
+    cap_add:
+      - IPC_LOCK
+    command: ["server", "-dev", "-dev-root-token-id=${OPENBAO_DEV_ROOT_TOKEN:-openbao-local-root-token}"]
+    environment:
+      BAO_DEV_ROOT_TOKEN_ID: ${OPENBAO_DEV_ROOT_TOKEN:-openbao-local-root-token}
+      BAO_ADDR: http://0.0.0.0:8200
+    ports:
+      - "${HOST_BIND:-127.0.0.1}:${OPENBAO_PORT:-8200}:8200"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8200/v1/sys/health >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    restart: unless-stopped
+    environment:
+      DEMO_MODE: ${DEMO_MODE:-false}
+      ACTIVITY_DB_PATH: ${ACTIVITY_DB_PATH:-/workspace/backend/data/activity.db}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
+      HOST: 0.0.0.0
+      PORT: 8000
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-activity}:${POSTGRES_PASSWORD:-activity-local-password}@postgres:5432/${POSTGRES_DB:-activity_policy}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-activity_policy}
+      POSTGRES_USER: ${POSTGRES_USER:-activity}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-activity-local-password}
+      NATS_URL: nats://nats:4222
+      VALKEY_URL: redis://valkey:6379/0
+      REDIS_URL: redis://valkey:6379/0
+      S3_ENDPOINT_URL: http://minio:9000
+      AWS_ENDPOINT_URL_S3: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minio-local-password}
+      S3_BUCKET: ${MINIO_BUCKET:-activity-artifacts}
+      KEYCLOAK_URL: http://keycloak:8080
+      KEYCLOAK_REALM: ${KEYCLOAK_REALM:-activity}
+      OPENBAO_ADDR: http://openbao:8200
+      OPENBAO_TOKEN: ${OPENBAO_DEV_ROOT_TOKEN:-openbao-local-root-token}
+      OLLAMA_BASE_URL: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:3b}
+      BACKEND_HEALTH_PATH: ${BACKEND_HEALTH_PATH:-/healthz}
+      BACKEND_MODULE: ${BACKEND_MODULE:-}
+      BACKEND_COMMAND: ${BACKEND_COMMAND:-}
+    ports:
+      - "${HOST_BIND:-127.0.0.1}:${BACKEND_PORT:-8000}:8000"
+    volumes:
+      - ./backend/data:/workspace/backend/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      keycloak:
+        condition: service_healthy
+      openbao:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:8000' + os.getenv('BACKEND_HEALTH_PATH', '/healthz'), timeout=3)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    restart: unless-stopped
+    environment:
+      DEMO_MODE: ${DEMO_MODE:-false}
+      # The existing Vite client intentionally falls back to its local demo
+      # data when VITE_API_BASE_URL is empty.
+      VITE_API_BASE_URL: ${VITE_API_BASE_URL:-}
+      VITE_API_URL: ${PUBLIC_BACKEND_URL:-http://localhost:8000}
+      FRONTEND_PORT: 5173
+      FRONTEND_SCRIPT: ${FRONTEND_SCRIPT:-dev}
+      FRONTEND_COMMAND: ${FRONTEND_COMMAND:-}
+    ports:
+      - "${HOST_BIND:-127.0.0.1}:${FRONTEND_PORT:-5173}:5173"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:5173').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["ai"]
+    restart: unless-stopped
+    ports:
+      - "${HOST_BIND:-127.0.0.1}:${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+volumes:
+  postgres_data:
+  nats_data:
+  valkey_data:
+  minio_data:
+  keycloak_data:
+  ollama_data:
