@@ -111,7 +111,18 @@ class GitHubConnector:
                 steps = ["Confirm the organization login matches the final path segment of the organization URL.", "Do not use a personal GitHub username unless it is the organization login.", "Save the credential and test again."] if org_status == 404 else ["Grant Administration: read access to the fine-grained token, or the required organization audit permission.", "Confirm the organization login is correct.", "Save the credential and test again."]
                 return ConnectionTest(status="degraded", checks=checks, remediation=Remediation(summary=summary, steps=steps, test_actions=["Create a test branch or fork after access is granted."]))
             audit_status, audit_payload = self._request(connection, f"/orgs/{urllib.parse.quote(org)}/audit-log?per_page=20")
-            if audit_status in {401, 403, 404}:
+            if audit_status in {403, 404}:
+                fallback_events, repository_count = self._poll_repository_events(connection, org)
+                self._last_events[connection.id] = fallback_events
+                checks[2] = Check(name="required_scopes", status=CheckStatus.SKIPPED, code="AUDIT_LOG_UNAVAILABLE", message="Organization audit-log API is unavailable for this GitHub organization.")
+                checks[3] = Check(name="event_subscription", status=CheckStatus.PASSED, code="REPOSITORY_EVENT_POLLING", message="Repository event polling is available.")
+                if fallback_events:
+                    checks[4] = Check(name="sample_event", status=CheckStatus.PASSED, message=f"Retrieved {len(fallback_events)} repository events.")
+                    return ConnectionTest(status="passed", checks=checks, remediation=Remediation(summary="Organization audit logs are unavailable, so repository events are being used.", steps=["Keep the connection enabled to poll accessible repositories.", "For administrative audit events, use GitHub Enterprise Cloud with read:audit_log access."], test_actions=["Push a commit or fork a repository in the organization, then test again."]))
+                no_repositories = repository_count == 0
+                checks[4] = Check(name="sample_event", status=CheckStatus.NOT_AVAILABLE, code="NO_REPOSITORIES" if no_repositories else "NO_ACTIVITY")
+                return ConnectionTest(status="degraded", checks=checks, remediation=Remediation(summary="No repository events were returned." if not no_repositories else "The organization has no accessible repositories yet.", steps=["Move or create a repository inside the organization.", "Push a commit or fork a repository.", "Test the connection again."], test_actions=["Push a commit or fork a repository in the organization."]))
+            if audit_status == 401:
                 checks[2] = Check(name="required_scopes", status=CheckStatus.FAILED, code="MISSING_AUDIT_ACCESS", message="The token cannot read the organization audit log.")
                 checks[3] = Check(name="event_subscription", status=CheckStatus.SKIPPED)
                 return ConnectionTest(status="degraded", checks=checks, remediation=Remediation(summary="The token is valid but lacks organization audit-log access.", steps=["Grant the organization audit-log permission to the token.", "Save the updated credential and test again."], test_actions=["Create a test branch, fork, or clone event after the permission is granted."]))
@@ -128,6 +139,41 @@ class GitHubConnector:
             return ConnectionTest(status="failed", checks=[checks[0], Check(name="api_reachability", status=CheckStatus.FAILED, code="API_UNREACHABLE", message=str(exc.reason)), Check(name="required_scopes", status=CheckStatus.SKIPPED), Check(name="event_subscription", status=CheckStatus.SKIPPED), Check(name="sample_event", status=CheckStatus.NOT_AVAILABLE)], remediation=Remediation(summary="The GitHub API could not be reached.", steps=["Check the API URL and network access from the backend.", "Try the connection test again."], test_actions=[]))
         except Exception as exc:
             return ConnectionTest(status="failed", checks=[checks[0], Check(name="api_reachability", status=CheckStatus.FAILED, code="GITHUB_API_ERROR", message=str(exc)), Check(name="required_scopes", status=CheckStatus.SKIPPED), Check(name="event_subscription", status=CheckStatus.SKIPPED), Check(name="sample_event", status=CheckStatus.NOT_AVAILABLE)], remediation=Remediation(summary="GitHub returned an unexpected response.", steps=["Inspect the API URL and organization name.", "Try the connection test again."], test_actions=[]))
+
+    def _poll_repository_events(self, connection: Connection, organization: str) -> tuple[list[NormalizedEvent], int]:
+        repository_status, repositories = self._request(connection, f"/orgs/{urllib.parse.quote(organization)}/repos?per_page=100&type=all")
+        if repository_status >= 400 or not isinstance(repositories, list):
+            return [], 0
+        normalized: list[NormalizedEvent] = []
+        for repository in repositories:
+            if not isinstance(repository, dict):
+                continue
+            full_name = str(repository.get("full_name") or "").strip()
+            if not full_name:
+                continue
+            event_status, payloads = self._request(connection, f"/repos/{urllib.parse.quote(full_name, safe='/')}/events?per_page=30")
+            if event_status >= 400 or not isinstance(payloads, list):
+                continue
+            for payload in payloads:
+                if not isinstance(payload, dict):
+                    continue
+                event = dict(payload)
+                event["event_type"] = self._repository_event_type(payload)
+                event["repository"] = {"id": repository.get("id"), "name": repository.get("name"), "full_name": full_name, "organization": organization}
+                event["occurred_at"] = payload.get("created_at") or utcnow()
+                normalized.append(self.normalize(event, connection, utcnow()))
+        return normalized, len(repositories)
+
+    @staticmethod
+    def _repository_event_type(payload: dict[str, Any]) -> str:
+        event_type = str(payload.get("type") or "").lower()
+        if event_type == "pushevent":
+            return "repository.commit"
+        if event_type == "forkevent":
+            return "repository.fork"
+        if event_type == "createevent" and payload.get("payload", {}).get("ref_type") == "repository":
+            return "repository.create"
+        return f"github.{event_type or 'activity'}"
 
     def _request(self, connection: Connection, path: str) -> tuple[int, Any]:
         configured_url = str(connection.config.get("api_url") or "https://api.github.com").rstrip("/")

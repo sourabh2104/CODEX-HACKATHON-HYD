@@ -251,8 +251,11 @@ def test_connection(connection_id: str, workspace_id: str = Depends(workspace), 
 @api.post("/connections/{connection_id}/enable")
 def enable_connection(connection_id: str, workspace_id: str = Depends(workspace), who: str = Depends(actor)) -> Connection:
     connection = connection_or_404(workspace_id, connection_id)
-    if not connection.last_test or connection.last_test.status != "passed":
-        raise HTTPException(status_code=409, detail={"code": "CONNECTION_NOT_READY", "message": "Run a successful staged connection test before enabling ingestion."})
+    if not connection.last_test:
+        raise HTTPException(status_code=409, detail={"code": "CONNECTION_NOT_READY", "message": "Run a staged connection test before enabling ingestion."})
+    blocking_checks = {"credentials", "api_reachability", "required_scopes"}
+    if connection.last_test.status == "failed" or any(check.name in blocking_checks and check.status == "failed" for check in connection.last_test.checks):
+        raise HTTPException(status_code=409, detail={"code": "CONNECTION_NOT_READY", "message": "Resolve the failed credential, API, or access checks before enabling ingestion."})
     connection.enabled = True
     connection.status = ConnectionStatus.CONNECTED
     connection.updated_at = datetime.now(timezone.utc)

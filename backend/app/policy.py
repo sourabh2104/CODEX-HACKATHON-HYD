@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from .llm import OllamaPolicyPlanner
 from .models import (
     NormalizedEvent,
     PolicyArtifact,
@@ -104,13 +105,17 @@ def generate_policy(draft: PolicyDraft) -> PolicyArtifact:
     assumptions = [f"Event times are interpreted in {draft.timezone}.", "Quiet hours use the half-open interval 01:00 inclusive through 05:00 exclusive.", "Missing actor or timestamp fields do not match."]
     if draft.exclusions:
         assumptions.append("Configured service accounts and actor IDs are excluded.")
+    plan = OllamaPolicyPlanner().plan(prompt=draft.prompt, timezone=draft.timezone, event_types=required_types)
+    if plan:
+        summary = plan.summary
+        assumptions.extend(plan.assumptions)
     source_hash = validate_policy_source(SUSPICIOUS_HOURS_SOURCE)
     return PolicyArtifact(
         policy_name=draft.name, summary=summary,
         intent={"scenario": "suspicious_hours", "quiet_start": "01:00", "quiet_end": "05:00", "timezone": draft.timezone, "exclusions": draft.exclusions},
         required_event_types=required_types, required_fields=["event_type", "occurred_at", "actor.id", "actor.service_account"],
         assumptions=assumptions, severity=draft.severity, action_ref=draft.action_ref, python_source=SUSPICIOUS_HOURS_SOURCE,
-        source_sha256=source_hash, test_cases=suspicious_hours_cases(draft.timezone, draft.exclusions),
+        source_sha256=source_hash, generator="ollama-policy-planner-v1" if plan else "deterministic-suspicious-hours-v1", test_cases=suspicious_hours_cases(draft.timezone, draft.exclusions),
     )
 
 
